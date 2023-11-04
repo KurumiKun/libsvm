@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -15,18 +16,12 @@
 int libsvm_version = LIBSVM_VERSION;
 typedef float Qfloat;
 typedef signed char schar;
-#ifndef min
-template <class T> static inline T min(T x,T y) { return (x<y)?x:y; }
-#endif
-#ifndef max
-template <class T> static inline T max(T x,T y) { return (x>y)?x:y; }
-#endif
-template <class T> static inline void swap(T& x, T& y) { T t=x; x=y; y=t; }
-template <class S, class T> static inline void clone(T*& dst, S* src, int n)
-{
-	dst = new T[n];
-	memcpy((void *)dst,(void *)src,sizeof(T)*n);
-}
+#define min(x, y) ( ((x) < (y)) ? (x) : (y) )
+#define max(x, y) ( ((x) > (y)) ? (x) : (y) )
+#define swap(x, y) do { typeof(x) SWAP = x; x = y; y = SWAP; } while (0)
+#define clone(dst, src, n) do \
+{ dst = malloc(sizeof(typeof(*dst)) * n); memcpy((void *)dst,(void *)src,sizeof(typeof(*dst))*n); } while (0)
+
 static inline double powi(double base, int times)
 {
 	double tmp = base, ret = 1.0;
@@ -41,6 +36,11 @@ static inline double powi(double base, int times)
 #define INF HUGE_VAL
 #define TAU 1e-12
 #define Malloc(type,n) (type *)malloc((n)*sizeof(type))
+
+typedef struct svm_node svm_node;
+typedef struct svm_problem svm_problem;
+typedef struct svm_parameter svm_parameter;
+typedef struct svm_model svm_model;
 
 static void print_string_stdout(const char *s)
 {
@@ -68,108 +68,110 @@ static void info(const char *fmt,...) {}
 // l is the number of total data items
 // size is the cache size limit in bytes
 //
-class Cache
+typedef struct head_t_Struct
 {
-public:
-	Cache(int l,long int size);
-	~Cache();
+    struct head_t_Struct *prev, *next;	// a circular list
+    Qfloat *data;
+    int len;		// data[0,len) is cached in this entry
+} head_t;
+typedef struct Cache_Struct
+{
+//public:
+//	Cache(int l,long int size);
+//	~Cache();
 
 	// request data [0,len)
 	// return some position p where [p,len) need to be filled
 	// (p >= len if nothing needs to be filled)
-	int get_data(const int index, Qfloat **data, int len);
-	void swap_index(int i, int j);
-private:
+//	int get_data(const int index, Qfloat **data, int len);
+//	void swap_index(int i, int j);
+//private:
 	int l;
 	long int size;
-	struct head_t
-	{
-		head_t *prev, *next;	// a circular list
-		Qfloat *data;
-		int len;		// data[0,len) is cached in this entry
-	};
+
 
 	head_t *head;
 	head_t lru_head;
-	void lru_delete(head_t *h);
-	void lru_insert(head_t *h);
-};
+//	void lru_delete(head_t *h);
+//	void lru_insert(head_t *h);
+} Cache;
 
-Cache::Cache(int l_,long int size_):l(l_),size(size_)
-{
-	head = (head_t *)calloc(l,sizeof(head_t));	// initialized to 0
-	size /= sizeof(Qfloat);
-	size -= l * sizeof(head_t) / sizeof(Qfloat);
-	size = max(size, 2 * (long int) l);	// cache must be large enough for two columns
-	lru_head.next = lru_head.prev = &lru_head;
+Cache* Cache__new(int l,long int size) {
+    Cache* this = malloc(sizeof(Cache));
+    this->head = (head_t *)calloc(l,sizeof(head_t));	// initialized to 0
+    this->size /= sizeof(Qfloat);
+    this->size -= l * sizeof(head_t) / sizeof(Qfloat);
+    this->size = max(size, 2 * (long int) l);	// cache must be large enough for two columns
+    this->lru_head.next = this->lru_head.prev = &this->lru_head;
+    return this;
 }
 
-Cache::~Cache()
+void Cache__destructor(Cache* this)
 {
-	for(head_t *h = lru_head.next; h != &lru_head; h=h->next)
+	for(head_t *h = this->lru_head.next; h != &this->lru_head; h=h->next)
 		free(h->data);
-	free(head);
+	free(this->head);
 }
 
-void Cache::lru_delete(head_t *h)
+void Cache__lru_delete(Cache* this, head_t *h)
 {
 	// delete from current location
 	h->prev->next = h->next;
 	h->next->prev = h->prev;
 }
 
-void Cache::lru_insert(head_t *h)
+void Cache__lru_insert(Cache* this, head_t *h)
 {
 	// insert to last position
-	h->next = &lru_head;
-	h->prev = lru_head.prev;
+	h->next = &this->lru_head;
+	h->prev = this->lru_head.prev;
 	h->prev->next = h;
 	h->next->prev = h;
 }
 
-int Cache::get_data(const int index, Qfloat **data, int len)
+int Cache__get_data(Cache* this, const int index, Qfloat **data, int len)
 {
-	head_t *h = &head[index];
-	if(h->len) lru_delete(h);
+	head_t *h = &this->head[index];
+	if(h->len) Cache__lru_delete(this, h);
 	int more = len - h->len;
 
 	if(more > 0)
 	{
 		// free old space
-		while(size < more)
+		while(this->size < more)
 		{
-			head_t *old = lru_head.next;
-			lru_delete(old);
+			head_t *old = this->lru_head.next;
+			Cache__lru_delete(this, old);
 			free(old->data);
-			size += old->len;
+			this->size += old->len;
 			old->data = 0;
 			old->len = 0;
 		}
 
 		// allocate new space
 		h->data = (Qfloat *)realloc(h->data,sizeof(Qfloat)*len);
-		size -= more;
+		this->size -= more;
 		swap(h->len,len);
 	}
 
-	lru_insert(h);
+	Cache__lru_insert(this, h);
 	*data = h->data;
 	return len;
 }
 
-void Cache::swap_index(int i, int j)
+void Cache__swap_index(Cache* this, int i, int j)
 {
 	if(i==j) return;
 
-	if(head[i].len) lru_delete(&head[i]);
-	if(head[j].len) lru_delete(&head[j]);
-	swap(head[i].data,head[j].data);
-	swap(head[i].len,head[j].len);
-	if(head[i].len) lru_insert(&head[i]);
-	if(head[j].len) lru_insert(&head[j]);
+	if(this->head[i].len) Cache__lru_delete(this, &this->head[i]);
+	if(this->head[j].len) Cache__lru_delete(this, &this->head[j]);
+	swap(this->head[i].data,this->head[j].data);
+	swap(this->head[i].len,this->head[j].len);
+	if(this->head[i].len) Cache__lru_insert(this, &this->head[i]);
+	if(this->head[j].len) Cache__lru_insert(this, &this->head[j]);
 
 	if(i>j) swap(i,j);
-	for(head_t *h = lru_head.next; h!=&lru_head; h=h->next)
+	for(head_t *h = this->lru_head.next; h!=&this->lru_head; h=h->next)
 	{
 		if(h->len > i)
 		{
@@ -178,9 +180,9 @@ void Cache::swap_index(int i, int j)
 			else
 			{
 				// give up
-				lru_delete(h);
+                Cache__lru_delete(this, h);
 				free(h->data);
-				size += h->len;
+                this->size += h->len;
 				h->data = 0;
 				h->len = 0;
 			}
@@ -195,6 +197,13 @@ void Cache::swap_index(int i, int j)
 // the constructor of Kernel prepares to calculate the l*l kernel matrix
 // the member function get_Q is for getting one column from the Q Matrix
 //
+typedef struct QMatrix_Struct QMatrix;
+typedef struct SVC_Q_extends_Kernel_Struct SVC_Q;
+typedef struct ONE_CLASS_Q_extends_Kernel_Struct ONE_CLASS_Q;
+typedef struct SVR_Q_extends_Kernel_Struct SVR_Q;
+
+struct QMatrix_Struct {
+/*
 class QMatrix {
 public:
 	virtual Qfloat *get_Q(int column, int len) const = 0;
@@ -202,100 +211,168 @@ public:
 	virtual void swap_index(int i, int j) const = 0;
 	virtual ~QMatrix() {}
 };
+*/
+};
+Qfloat *QMatrix_virtual__get_Q(SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int column, int len);
+double *QMatrix_virtual__get_QD(SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q);
+void QMatrix_virtual__swap_index(SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int i, int j);
 
-class Kernel: public QMatrix {
-public:
-	Kernel(int l, svm_node * const * x, const svm_parameter& param);
-	virtual ~Kernel();
+Qfloat *SVC_Q__get_Q(SVC_Q* this, int i, int len);
+Qfloat *ONE_CLASS_Q__get_Q(ONE_CLASS_Q* this, int i, int len);
+Qfloat *SVR_Q__get_Q(SVR_Q* this, int i, int len);
+Qfloat *QMatrix_virtual__get_Q(SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int column, int len) {
+    if(svc_q) {
+        return SVC_Q__get_Q(svc_q, column, len);
+    }
+    if(one_class_q) {
+        return ONE_CLASS_Q__get_Q(one_class_q, column, len);
+    }
+    if(svr_q) {
+        return SVR_Q__get_Q(svr_q, column, len);
+    }
+    exit(11);
+}
 
-	static double k_function(const svm_node *x, const svm_node *y,
-				 const svm_parameter& param);
-	virtual Qfloat *get_Q(int column, int len) const = 0;
-	virtual double *get_QD() const = 0;
-	virtual void swap_index(int i, int j) const	// no so const...
-	{
-		swap(x[i],x[j]);
-		if(x_square) swap(x_square[i],x_square[j]);
-	}
-protected:
+double *SVC_Q__get_QD(SVC_Q* this);
+double *ONE_CLASS_Q__get_QD(ONE_CLASS_Q* this);
+double *SVR_Q__get_QD(SVR_Q* this);
+double *QMatrix_virtual__get_QD(SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q) {
+    if(svc_q) {
+        return SVC_Q__get_QD(svc_q);
+    }
+    if(one_class_q) {
+        return ONE_CLASS_Q__get_QD(one_class_q);
+    }
+    if(svr_q) {
+        return SVR_Q__get_QD(svr_q);
+    }
+    exit(12);
+}
 
-	double (Kernel::*kernel_function)(int i, int j) const;
+void SVC_Q__swap_index(SVC_Q* this, int i, int j);
+void ONE_CLASS_Q__swap_index(ONE_CLASS_Q* this, int i, int j);
+void SVR_Q__swap_index(SVR_Q* this, int i, int j);
+void QMatrix_virtual__swap_index(SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int i, int j) {
+    if(svc_q) {
+        return SVC_Q__swap_index(svc_q, i, j);
+    }
+    if(one_class_q) {
+        return ONE_CLASS_Q__swap_index(one_class_q, i, j);
+    }
+    if(svr_q) {
+        return SVR_Q__swap_index(svr_q, i, j);
+    }
+    exit(12);
+}
 
-private:
-	const svm_node **x;
+
+typedef struct Kernel_extends_QMatrix_Struct Kernel;
+struct Kernel_extends_QMatrix_Struct {
+    QMatrix *superQMatrix;
+//public:
+//    Kernel(int l, svm_node * const * x, const svm_parameter& param);
+//    virtual ~Kernel();
+
+//	static double k_function(const svm_node *x, const svm_node *y,
+//				 const svm_parameter& param);
+//	virtual Qfloat *get_Q(int column, int len) const = 0;
+//	virtual double *get_QD() const = 0;
+//	virtual void swap_index(int i, int j) const	// no so const...
+//	{
+//		swap(x[i],x[j]);
+//		if(x_square) swap(x_square[i],x_square[j]);
+//	}
+//protected:
+
+//	double (Kernel::*kernel_function)(int i, int j) const;
+    double (*kernel_function)(Kernel *this,int i, int j);
+
+//private:
+	const struct svm_node **x;
 	double *x_square;
 
 	// svm_parameter
-	const int kernel_type;
-	const int degree;
-	const double gamma;
-	const double coef0;
+	int kernel_type;
+	int degree;
+	double gamma;
+	double coef0;
 
-	static double dot(const svm_node *px, const svm_node *py);
-	double kernel_linear(int i, int j) const
-	{
-		return dot(x[i],x[j]);
-	}
-	double kernel_poly(int i, int j) const
-	{
-		return powi(gamma*dot(x[i],x[j])+coef0,degree);
-	}
-	double kernel_rbf(int i, int j) const
-	{
-		return exp(-gamma*(x_square[i]+x_square[j]-2*dot(x[i],x[j])));
-	}
-	double kernel_sigmoid(int i, int j) const
-	{
-		return tanh(gamma*dot(x[i],x[j])+coef0);
-	}
-	double kernel_precomputed(int i, int j) const
-	{
-		return x[i][(int)(x[j][0].value)].value;
-	}
 };
-
-Kernel::Kernel(int l, svm_node * const * x_, const svm_parameter& param)
-:kernel_type(param.kernel_type), degree(param.degree),
- gamma(param.gamma), coef0(param.coef0)
+void Kernel__swap_index(Kernel* this, int i, int j) {
+    swap(this->x[i],this->x[j]);
+    if(this->x_square) swap(this->x_square[i],this->x_square[j]);
+}
+static double Kernel__dot(const struct svm_node *px, const struct svm_node *py);
+double Kernel__kernel_linear(Kernel* this, int i, int j)
 {
-	switch(kernel_type)
+    return Kernel__dot(this->x[i],this->x[j]);
+}
+double Kernel__kernel_poly(Kernel* this, int i, int j)
+{
+    return powi(this->gamma*Kernel__dot(this->x[i],this->x[j])+this->coef0,this->degree);
+}
+double Kernel__kernel_rbf(Kernel* this, int i, int j)
+{
+    return exp(-this->gamma*(this->x_square[i]+this->x_square[j]-2*Kernel__dot(this->x[i],this->x[j])));
+}
+double Kernel__kernel_sigmoid(Kernel* this, int i, int j)
+{
+    return tanh(this->gamma*Kernel__dot(this->x[i],this->x[j])+this->coef0);
+}
+double Kernel__kernel_precomputed(Kernel* this, int i, int j)
+{
+    return this->x[i][(int)(this->x[j][0].value)].value;
+}
+
+Kernel* Kernel__new(int l, struct svm_node * const * x_, const struct svm_parameter param)
+//:kernel_type(param.kernel_type), degree(param.degree),
+// gamma(param.gamma), coef0(param.coef0)
+{
+    Kernel* this = malloc(sizeof(Kernel));this->superQMatrix = Malloc(QMatrix, 1);
+    this->kernel_type = param.kernel_type;
+    this->degree = param.degree;
+    this->gamma = param.gamma;
+    this->coef0 = param.coef0;
+	switch(this->kernel_type)
 	{
 		case LINEAR:
-			kernel_function = &Kernel::kernel_linear;
+			this->kernel_function = &Kernel__kernel_linear;
 			break;
 		case POLY:
-			kernel_function = &Kernel::kernel_poly;
+            this->kernel_function = &Kernel__kernel_poly;
 			break;
 		case RBF:
-			kernel_function = &Kernel::kernel_rbf;
+            this->kernel_function = &Kernel__kernel_rbf;
 			break;
 		case SIGMOID:
-			kernel_function = &Kernel::kernel_sigmoid;
+            this->kernel_function = &Kernel__kernel_sigmoid;
 			break;
 		case PRECOMPUTED:
-			kernel_function = &Kernel::kernel_precomputed;
+            this->kernel_function = &Kernel__kernel_precomputed;
 			break;
 	}
 
-	clone(x,x_,l);
+	clone(this->x,x_,l);
 
-	if(kernel_type == RBF)
+	if(this->kernel_type == RBF)
 	{
-		x_square = new double[l];
+        this->x_square = malloc(sizeof(double) * l);
 		for(int i=0;i<l;i++)
-			x_square[i] = dot(x[i],x[i]);
+            this->x_square[i] = Kernel__dot(this->x[i],this->x[i]);
 	}
 	else
-		x_square = 0;
+        this->x_square = 0;
+
+    return this;
 }
 
-Kernel::~Kernel()
+void Kernel__destructor(Kernel* this)
 {
-	delete[] x;
-	delete[] x_square;
+	free(this->x);
+	free(this->x_square);
 }
 
-double Kernel::dot(const svm_node *px, const svm_node *py)
+double Kernel__dot(const struct svm_node *px, const struct svm_node *py)
 {
 	double sum = 0;
 	while(px->index != -1 && py->index != -1)
@@ -317,15 +394,15 @@ double Kernel::dot(const svm_node *px, const svm_node *py)
 	return sum;
 }
 
-double Kernel::k_function(const svm_node *x, const svm_node *y,
-			  const svm_parameter& param)
+double Kernel__k_function(const struct svm_node *x, const struct svm_node *y,
+			  const struct svm_parameter param)
 {
 	switch(param.kernel_type)
 	{
 		case LINEAR:
-			return dot(x,y);
+			return Kernel__dot(x,y);
 		case POLY:
-			return powi(param.gamma*dot(x,y)+param.coef0,param.degree);
+			return powi(param.gamma*Kernel__dot(x,y)+param.coef0,param.degree);
 		case RBF:
 		{
 			double sum = 0;
@@ -368,7 +445,7 @@ double Kernel::k_function(const svm_node *x, const svm_node *y,
 			return exp(-param.gamma*sum);
 		}
 		case SIGMOID:
-			return tanh(param.gamma*dot(x,y)+param.coef0);
+			return tanh(param.gamma*Kernel__dot(x,y)+param.coef0);
 		case PRECOMPUTED:  //x: test (validation), y: SV
 			return x[(int)(y->value)].value;
 		default:
@@ -394,30 +471,35 @@ double Kernel::k_function(const svm_node *x, const svm_node *y,
 //
 // solution will be put in \alpha, objective value will be put in obj
 //
-class Solver {
-public:
-	Solver() {};
-	virtual ~Solver() {};
+typedef struct SolutionInfo_Struct SolutionInfo;
+struct SolutionInfo_Struct {
+    double obj;
+    double rho;
+    double upper_bound_p;
+    double upper_bound_n;
+    double r;	// for Solver_NU
+};
 
-	struct SolutionInfo {
-		double obj;
-		double rho;
-		double upper_bound_p;
-		double upper_bound_n;
-		double r;	// for Solver_NU
-	};
+typedef struct Solver_Struct Solver;
+typedef struct Solver_NU_extends_Solver_Struct Solver_NU;
+struct Solver_Struct {
+//public:
+//	Solver() {};
+//	virtual ~Solver() {};
 
-	void Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
-		   double *alpha_, double Cp, double Cn, double eps,
-		   SolutionInfo* si, int shrinking);
-protected:
+
+
+//	void Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
+//		   double *alpha_, double Cp, double Cn, double eps,
+//		   SolutionInfo* si, int shrinking);
+//protected:
 	int active_size;
 	schar *y;
 	double *G;		// gradient of objective function
 	enum { LOWER_BOUND, UPPER_BOUND, FREE };
 	char *alpha_status;	// LOWER_BOUND, UPPER_BOUND, FREE
 	double *alpha;
-	const QMatrix *Q;
+//	const QMatrix *Q;
 	const double *QD;
 	double eps;
 	double Cp,Cn;
@@ -427,135 +509,158 @@ protected:
 	int l;
 	bool unshrink;	// XXX
 
-	double get_C(int i)
-	{
-		return (y[i] > 0)? Cp : Cn;
-	}
-	void update_alpha_status(int i)
-	{
-		if(alpha[i] >= get_C(i))
-			alpha_status[i] = UPPER_BOUND;
-		else if(alpha[i] <= 0)
-			alpha_status[i] = LOWER_BOUND;
-		else alpha_status[i] = FREE;
-	}
-	bool is_upper_bound(int i) { return alpha_status[i] == UPPER_BOUND; }
-	bool is_lower_bound(int i) { return alpha_status[i] == LOWER_BOUND; }
-	bool is_free(int i) { return alpha_status[i] == FREE; }
-	void swap_index(int i, int j);
-	void reconstruct_gradient();
-	virtual int select_working_set(int &i, int &j);
-	virtual double calculate_rho();
-	virtual void do_shrinking();
-private:
-	bool be_shrunk(int i, double Gmax1, double Gmax2);
+//	double get_C(int i)
+//	{
+//		return (y[i] > 0)? Cp : Cn;
+//	}
+//	void update_alpha_status(int i)
+//	{
+//		if(alpha[i] >= get_C(i))
+//			alpha_status[i] = UPPER_BOUND;
+//		else if(alpha[i] <= 0)
+//			alpha_status[i] = LOWER_BOUND;
+//		else alpha_status[i] = FREE;
+//	}
+//	bool is_upper_bound(int i) { return alpha_status[i] == UPPER_BOUND; }
+//	bool is_lower_bound(int i) { return alpha_status[i] == LOWER_BOUND; }
+//	bool is_free(int i) { return alpha_status[i] == FREE; }
+//	void swap_index(int i, int j);
+//	void reconstruct_gradient();
+//	virtual int select_working_set(int &i, int &j);
+//	virtual double calculate_rho();
+//	virtual void do_shrinking();
+//private:
+//	bool be_shrunk(int i, double Gmax1, double Gmax2);
 };
+int Solver_virtual__select_working_set(Solver *solver, Solver_NU *solver_nu, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int *out_i, int *out_j);
+double Solver_virtual__calculate_rho(Solver *solver, Solver_NU *solver_nu);
+void Solver_virtual__do_shrinking(Solver *solver, Solver_NU *solver_nu, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q);
 
-void Solver::swap_index(int i, int j)
+double Solver__get_C(Solver* this, int i)
 {
-	Q->swap_index(i,j);
-	swap(y[i],y[j]);
-	swap(G[i],G[j]);
-	swap(alpha_status[i],alpha_status[j]);
-	swap(alpha[i],alpha[j]);
-	swap(p[i],p[j]);
-	swap(active_set[i],active_set[j]);
-	swap(G_bar[i],G_bar[j]);
+    return (this->y[i] > 0)? this->Cp : this->Cn;
 }
 
-void Solver::reconstruct_gradient()
+void Solver__update_alpha_status(Solver* this, int i)
+{
+    if(this->alpha[i] >= Solver__get_C(this, i))
+        this->alpha_status[i] = UPPER_BOUND;
+    else if(this->alpha[i] <= 0)
+        this->alpha_status[i] = LOWER_BOUND;
+    else this->alpha_status[i] = FREE;
+}
+
+bool Solver__is_upper_bound(Solver* this, int i) { return this->alpha_status[i] == UPPER_BOUND; }
+
+bool Solver__is_lower_bound(Solver* this, int i) { return this->alpha_status[i] == LOWER_BOUND; }
+
+bool Solver__is_free(Solver* this, int i) { return this->alpha_status[i] == FREE; }
+
+void Solver__swap_index(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int i, int j)
+{
+    QMatrix_virtual__swap_index(svc_q, one_class_q, svr_q, i,j);
+	swap(this->y[i],this->y[j]);
+	swap(this->G[i],this->G[j]);
+	swap(this->alpha_status[i],this->alpha_status[j]);
+	swap(this->alpha[i],this->alpha[j]);
+	swap(this->p[i],this->p[j]);
+	swap(this->active_set[i],this->active_set[j]);
+	swap(this->G_bar[i],this->G_bar[j]);
+}
+
+void Solver__reconstruct_gradient(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q)
 {
 	// reconstruct inactive elements of G from G_bar and free variables
 
-	if(active_size == l) return;
+	if(this->active_size == this->l) return;
 
 	int i,j;
 	int nr_free = 0;
 
-	for(j=active_size;j<l;j++)
-		G[j] = G_bar[j] + p[j];
+	for(j=this->active_size;j<this->l;j++)
+        this->G[j] = this->G_bar[j] + this->p[j];
 
-	for(j=0;j<active_size;j++)
-		if(is_free(j))
+	for(j=0;j<this->active_size;j++)
+		if(Solver__is_free(this, j))
 			nr_free++;
 
-	if(2*nr_free < active_size)
+	if(2*nr_free < this->active_size)
 		info("\nWARNING: using -h 0 may be faster\n");
 
-	if (nr_free*l > 2*active_size*(l-active_size))
+	if (nr_free*this->l > 2*this->active_size*(this->l-this->active_size))
 	{
-		for(i=active_size;i<l;i++)
+		for(i=this->active_size;i<this->l;i++)
 		{
-			const Qfloat *Q_i = Q->get_Q(i,active_size);
-			for(j=0;j<active_size;j++)
-				if(is_free(j))
-					G[i] += alpha[j] * Q_i[j];
+			const Qfloat *Q_i = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q, i,this->active_size);
+			for(j=0;j<this->active_size;j++)
+				if(Solver__is_free(this, j))
+                    this->G[i] += this->alpha[j] * Q_i[j];
 		}
 	}
 	else
 	{
-		for(i=0;i<active_size;i++)
-			if(is_free(i))
+		for(i=0;i<this->active_size;i++)
+			if(Solver__is_free(this, i))
 			{
-				const Qfloat *Q_i = Q->get_Q(i,l);
-				double alpha_i = alpha[i];
-				for(j=active_size;j<l;j++)
-					G[j] += alpha_i * Q_i[j];
+				const Qfloat *Q_i = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q, i,this->l);
+				double alpha_i = this->alpha[i];
+				for(j=this->active_size;j<this->l;j++)
+                    this->G[j] += alpha_i * Q_i[j];
 			}
 	}
 }
 
-void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
+void Solver__Solve(Solver* this, Solver_NU *this_solver_nu, int l, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, const double *p_, const schar *y_,
 		   double *alpha_, double Cp, double Cn, double eps,
 		   SolutionInfo* si, int shrinking)
 {
 	this->l = l;
-	this->Q = &Q;
-	QD=Q.get_QD();
-	clone(p, p_,l);
-	clone(y, y_,l);
-	clone(alpha,alpha_,l);
+//	this->Q = Q;
+	this->QD= QMatrix_virtual__get_QD(svc_q, one_class_q, svr_q);
+	clone(this->p, p_,l);
+	clone(this->y, y_,l);
+	clone(this->alpha,alpha_,l);
 	this->Cp = Cp;
 	this->Cn = Cn;
 	this->eps = eps;
-	unshrink = false;
+	this->unshrink = false;
 
 	// initialize alpha_status
 	{
-		alpha_status = new char[l];
+        this->alpha_status = malloc(sizeof(char) * l);
 		for(int i=0;i<l;i++)
-			update_alpha_status(i);
+            Solver__update_alpha_status(this, i);
 	}
 
 	// initialize active set (for shrinking)
 	{
-		active_set = new int[l];
+        this->active_set = malloc(sizeof(int) * l);
 		for(int i=0;i<l;i++)
-			active_set[i] = i;
-		active_size = l;
+            this->active_set[i] = i;
+        this->active_size = l;
 	}
 
 	// initialize gradient
 	{
-		G = new double[l];
-		G_bar = new double[l];
+        this->G = malloc(sizeof(double) * l);
+        this->G_bar = malloc(sizeof(double) * l);
 		int i;
 		for(i=0;i<l;i++)
 		{
-			G[i] = p[i];
-			G_bar[i] = 0;
+            this->G[i] = this->p[i];
+            this->G_bar[i] = 0;
 		}
 		for(i=0;i<l;i++)
-			if(!is_lower_bound(i))
+			if(!Solver__is_lower_bound(this, i))
 			{
-				const Qfloat *Q_i = Q.get_Q(i,l);
-				double alpha_i = alpha[i];
+				const Qfloat *Q_i = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q, i,l);
+				double alpha_i = this->alpha[i];
 				int j;
 				for(j=0;j<l;j++)
-					G[j] += alpha_i*Q_i[j];
-				if(is_upper_bound(i))
+                    this->G[j] += alpha_i*Q_i[j];
+				if(Solver__is_upper_bound(this, i))
 					for(j=0;j<l;j++)
-						G_bar[j] += get_C(i) * Q_i[j];
+                        this->G_bar[j] += Solver__get_C(this, i) * Q_i[j];
 			}
 	}
 
@@ -572,19 +677,19 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 		if(--counter == 0)
 		{
 			counter = min(l,1000);
-			if(shrinking) do_shrinking();
+			if(shrinking) Solver_virtual__do_shrinking(this, this_solver_nu, svc_q, one_class_q, svr_q);
 			info(".");
 		}
 
 		int i,j;
-		if(select_working_set(i,j)!=0)
+		if(Solver_virtual__select_working_set(this, this_solver_nu, svc_q, one_class_q, svr_q, &i, &j)!=0)
 		{
 			// reconstruct the whole gradient
-			reconstruct_gradient();
+            Solver__reconstruct_gradient(this, svc_q, one_class_q, svr_q);
 			// reset active set size and check
-			active_size = l;
+			this->active_size = l;
 			info("*");
-			if(select_working_set(i,j)!=0)
+			if(Solver_virtual__select_working_set(this, this_solver_nu, svc_q, one_class_q, svr_q, &i, &j)!=0)
 				break;
 			else
 				counter = 1;	// do shrinking next iteration
@@ -594,151 +699,151 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 
 		// update alpha[i] and alpha[j], handle bounds carefully
 
-		const Qfloat *Q_i = Q.get_Q(i,active_size);
-		const Qfloat *Q_j = Q.get_Q(j,active_size);
+        const Qfloat *Q_i = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q, i, this->active_size);
+		const Qfloat *Q_j = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q,j,this->active_size);
 
-		double C_i = get_C(i);
-		double C_j = get_C(j);
+		double C_i = Solver__get_C(this, i);
+		double C_j = Solver__get_C(this, j);
 
-		double old_alpha_i = alpha[i];
-		double old_alpha_j = alpha[j];
+		double old_alpha_i = this->alpha[i];
+		double old_alpha_j = this->alpha[j];
 
-		if(y[i]!=y[j])
+		if(this->y[i]!=this->y[j])
 		{
-			double quad_coef = QD[i]+QD[j]+2*Q_i[j];
+			double quad_coef = this->QD[i]+this->QD[j]+2*Q_i[j];
 			if (quad_coef <= 0)
 				quad_coef = TAU;
-			double delta = (-G[i]-G[j])/quad_coef;
-			double diff = alpha[i] - alpha[j];
-			alpha[i] += delta;
-			alpha[j] += delta;
+			double delta = (-this->G[i]-this->G[j])/quad_coef;
+			double diff = this->alpha[i] - this->alpha[j];
+            this->alpha[i] += delta;
+            this->alpha[j] += delta;
 
 			if(diff > 0)
 			{
-				if(alpha[j] < 0)
+				if(this->alpha[j] < 0)
 				{
-					alpha[j] = 0;
-					alpha[i] = diff;
+                    this->alpha[j] = 0;
+                    this->alpha[i] = diff;
 				}
 			}
 			else
 			{
-				if(alpha[i] < 0)
+				if(this->alpha[i] < 0)
 				{
-					alpha[i] = 0;
-					alpha[j] = -diff;
+                    this->alpha[i] = 0;
+                    this->alpha[j] = -diff;
 				}
 			}
 			if(diff > C_i - C_j)
 			{
-				if(alpha[i] > C_i)
+				if(this->alpha[i] > C_i)
 				{
-					alpha[i] = C_i;
-					alpha[j] = C_i - diff;
+                    this->alpha[i] = C_i;
+                    this->alpha[j] = C_i - diff;
 				}
 			}
 			else
 			{
-				if(alpha[j] > C_j)
+				if(this->alpha[j] > C_j)
 				{
-					alpha[j] = C_j;
-					alpha[i] = C_j + diff;
+                    this->alpha[j] = C_j;
+                    this->alpha[i] = C_j + diff;
 				}
 			}
 		}
 		else
 		{
-			double quad_coef = QD[i]+QD[j]-2*Q_i[j];
+			double quad_coef = this->QD[i]+this->QD[j]-2*Q_i[j];
 			if (quad_coef <= 0)
 				quad_coef = TAU;
-			double delta = (G[i]-G[j])/quad_coef;
-			double sum = alpha[i] + alpha[j];
-			alpha[i] -= delta;
-			alpha[j] += delta;
+			double delta = (this->G[i]-this->G[j])/quad_coef;
+			double sum = this->alpha[i] + this->alpha[j];
+            this->alpha[i] -= delta;
+            this->alpha[j] += delta;
 
 			if(sum > C_i)
 			{
-				if(alpha[i] > C_i)
+				if(this->alpha[i] > C_i)
 				{
-					alpha[i] = C_i;
-					alpha[j] = sum - C_i;
+                    this->alpha[i] = C_i;
+                    this->alpha[j] = sum - C_i;
 				}
 			}
 			else
 			{
-				if(alpha[j] < 0)
+				if(this->alpha[j] < 0)
 				{
-					alpha[j] = 0;
-					alpha[i] = sum;
+                    this->alpha[j] = 0;
+                    this->alpha[i] = sum;
 				}
 			}
 			if(sum > C_j)
 			{
-				if(alpha[j] > C_j)
+				if(this->alpha[j] > C_j)
 				{
-					alpha[j] = C_j;
-					alpha[i] = sum - C_j;
+                    this->alpha[j] = C_j;
+                    this->alpha[i] = sum - C_j;
 				}
 			}
 			else
 			{
-				if(alpha[i] < 0)
+				if(this->alpha[i] < 0)
 				{
-					alpha[i] = 0;
-					alpha[j] = sum;
+                    this->alpha[i] = 0;
+                    this->alpha[j] = sum;
 				}
 			}
 		}
 
 		// update G
 
-		double delta_alpha_i = alpha[i] - old_alpha_i;
-		double delta_alpha_j = alpha[j] - old_alpha_j;
+		double delta_alpha_i = this->alpha[i] - old_alpha_i;
+		double delta_alpha_j = this->alpha[j] - old_alpha_j;
 
-		for(int k=0;k<active_size;k++)
+		for(int k=0;k<this->active_size;k++)
 		{
-			G[k] += Q_i[k]*delta_alpha_i + Q_j[k]*delta_alpha_j;
+            this->G[k] += Q_i[k]*delta_alpha_i + Q_j[k]*delta_alpha_j;
 		}
 
 		// update alpha_status and G_bar
 
 		{
-			bool ui = is_upper_bound(i);
-			bool uj = is_upper_bound(j);
-			update_alpha_status(i);
-			update_alpha_status(j);
+			bool ui = Solver__is_upper_bound(this, i);
+			bool uj = Solver__is_upper_bound(this, j);
+            Solver__update_alpha_status(this, i);
+            Solver__update_alpha_status(this, j);
 			int k;
-			if(ui != is_upper_bound(i))
+			if(ui != Solver__is_upper_bound(this, i))
 			{
-				Q_i = Q.get_Q(i,l);
+				Q_i = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q, i,l);
 				if(ui)
 					for(k=0;k<l;k++)
-						G_bar[k] -= C_i * Q_i[k];
+                        this->G_bar[k] -= C_i * Q_i[k];
 				else
 					for(k=0;k<l;k++)
-						G_bar[k] += C_i * Q_i[k];
+                        this->G_bar[k] += C_i * Q_i[k];
 			}
 
-			if(uj != is_upper_bound(j))
+			if(uj != Solver__is_upper_bound(this, j))
 			{
-				Q_j = Q.get_Q(j,l);
+				Q_j = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q, j,l);
 				if(uj)
 					for(k=0;k<l;k++)
-						G_bar[k] -= C_j * Q_j[k];
+                        this->G_bar[k] -= C_j * Q_j[k];
 				else
 					for(k=0;k<l;k++)
-						G_bar[k] += C_j * Q_j[k];
+                        this->G_bar[k] += C_j * Q_j[k];
 			}
 		}
 	}
 
 	if(iter >= max_iter)
 	{
-		if(active_size < l)
+		if(this->active_size < l)
 		{
 			// reconstruct the whole gradient to calculate objective value
-			reconstruct_gradient();
-			active_size = l;
+            Solver__reconstruct_gradient(this, svc_q, one_class_q, svr_q);
+            this->active_size = l;
 			info("*");
 		}
 		fprintf(stderr,"\nWARNING: reaching max number of iterations\n");
@@ -746,14 +851,14 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 
 	// calculate rho
 
-	si->rho = calculate_rho();
+	si->rho = Solver_virtual__calculate_rho(this, this_solver_nu);
 
 	// calculate objective value
 	{
 		double v = 0;
 		int i;
 		for(i=0;i<l;i++)
-			v += alpha[i] * (G[i] + p[i]);
+			v += this->alpha[i] * (this->G[i] + this->p[i]);
 
 		si->obj = v/2;
 	}
@@ -761,7 +866,7 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 	// put back the solution
 	{
 		for(int i=0;i<l;i++)
-			alpha_[active_set[i]] = alpha[i];
+			alpha_[this->active_set[i]] = this->alpha[i];
 	}
 
 	// juggle everything back
@@ -777,17 +882,25 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 
 	info("\noptimization finished, #iter = %d\n",iter);
 
-	delete[] p;
-	delete[] y;
-	delete[] alpha;
-	delete[] alpha_status;
-	delete[] active_set;
-	delete[] G;
-	delete[] G_bar;
+	free(this->p);
+	free(this->y);
+	free(this->alpha);
+	free(this->alpha_status);
+	free(this->active_set);
+	free(this->G);
+	free(this->G_bar);
 }
 
 // return 1 if already optimal, return 0 otherwise
-int Solver::select_working_set(int &out_i, int &out_j)
+int Solver__select_working_set(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int *out_i, int *out_j);
+int Solver_NU__select_working_set(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int *out_i, int *out_j);
+int Solver_virtual__select_working_set(Solver *solver, Solver_NU *solver_nu, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int *out_i, int *out_j) {
+    if(solver_nu) {
+        return Solver_NU__select_working_set(solver, svc_q, one_class_q, svr_q, out_i, out_j);
+    }
+    return Solver__select_working_set(solver, svc_q, one_class_q, svr_q, out_i, out_j);
+}
+int Solver__select_working_set(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int *out_i, int *out_j)
 {
 	// return i,j such that
 	// i: maximizes -y_i * grad(f)_i, i in I_up(\alpha)
@@ -801,22 +914,22 @@ int Solver::select_working_set(int &out_i, int &out_j)
 	int Gmin_idx = -1;
 	double obj_diff_min = INF;
 
-	for(int t=0;t<active_size;t++)
-		if(y[t]==+1)
+	for(int t=0;t<this->active_size;t++)
+		if(this->y[t]==+1)
 		{
-			if(!is_upper_bound(t))
-				if(-G[t] >= Gmax)
+			if(!Solver__is_upper_bound(this, t))
+				if(-this->G[t] >= Gmax)
 				{
-					Gmax = -G[t];
+					Gmax = -this->G[t];
 					Gmax_idx = t;
 				}
 		}
 		else
 		{
-			if(!is_lower_bound(t))
-				if(G[t] >= Gmax)
+			if(!Solver__is_lower_bound(this, t))
+				if(this->G[t] >= Gmax)
 				{
-					Gmax = G[t];
+					Gmax = this->G[t];
 					Gmax_idx = t;
 				}
 		}
@@ -824,21 +937,21 @@ int Solver::select_working_set(int &out_i, int &out_j)
 	int i = Gmax_idx;
 	const Qfloat *Q_i = NULL;
 	if(i != -1) // NULL Q_i not accessed: Gmax=-INF if i=-1
-		Q_i = Q->get_Q(i,active_size);
+		Q_i = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q, i,this->active_size);
 
-	for(int j=0;j<active_size;j++)
+	for(int j=0;j<this->active_size;j++)
 	{
-		if(y[j]==+1)
+		if(this->y[j]==+1)
 		{
-			if (!is_lower_bound(j))
+			if (!Solver__is_lower_bound(this, j))
 			{
-				double grad_diff=Gmax+G[j];
-				if (G[j] >= Gmax2)
-					Gmax2 = G[j];
+				double grad_diff=Gmax+this->G[j];
+				if (this->G[j] >= Gmax2)
+					Gmax2 = this->G[j];
 				if (grad_diff > 0)
 				{
 					double obj_diff;
-					double quad_coef = QD[i]+QD[j]-2.0*y[i]*Q_i[j];
+					double quad_coef = this->QD[i]+this->QD[j]-2.0*this->y[i]*Q_i[j];
 					if (quad_coef > 0)
 						obj_diff = -(grad_diff*grad_diff)/quad_coef;
 					else
@@ -854,15 +967,15 @@ int Solver::select_working_set(int &out_i, int &out_j)
 		}
 		else
 		{
-			if (!is_upper_bound(j))
+			if (!Solver__is_upper_bound(this, j))
 			{
-				double grad_diff= Gmax-G[j];
-				if (-G[j] >= Gmax2)
-					Gmax2 = -G[j];
+				double grad_diff= Gmax-this->G[j];
+				if (-this->G[j] >= Gmax2)
+					Gmax2 = -this->G[j];
 				if (grad_diff > 0)
 				{
 					double obj_diff;
-					double quad_coef = QD[i]+QD[j]+2.0*y[i]*Q_i[j];
+					double quad_coef = this->QD[i]+this->QD[j]+2.0*this->y[i]*Q_i[j];
 					if (quad_coef > 0)
 						obj_diff = -(grad_diff*grad_diff)/quad_coef;
 					else
@@ -878,114 +991,130 @@ int Solver::select_working_set(int &out_i, int &out_j)
 		}
 	}
 
-	if(Gmax+Gmax2 < eps || Gmin_idx == -1)
+	if(Gmax+Gmax2 < this->eps || Gmin_idx == -1)
 		return 1;
 
-	out_i = Gmax_idx;
-	out_j = Gmin_idx;
+	*out_i = Gmax_idx;
+	*out_j = Gmin_idx;
 	return 0;
 }
 
-bool Solver::be_shrunk(int i, double Gmax1, double Gmax2)
+bool Solver__be_shrunk(Solver* this, int i, double Gmax1, double Gmax2)
 {
-	if(is_upper_bound(i))
+	if(Solver__is_upper_bound(this, i))
 	{
-		if(y[i]==+1)
-			return(-G[i] > Gmax1);
+		if(this->y[i]==+1)
+			return(-this->G[i] > Gmax1);
 		else
-			return(-G[i] > Gmax2);
+			return(-this->G[i] > Gmax2);
 	}
-	else if(is_lower_bound(i))
+	else if(Solver__is_lower_bound(this, i))
 	{
-		if(y[i]==+1)
-			return(G[i] > Gmax2);
+		if(this->y[i]==+1)
+			return(this->G[i] > Gmax2);
 		else
-			return(G[i] > Gmax1);
+			return(this->G[i] > Gmax1);
 	}
 	else
 		return(false);
 }
 
-void Solver::do_shrinking()
+void Solver__do_shrinking(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q);
+void Solver_NU__do_shrinking(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q);
+void Solver_virtual__do_shrinking(Solver *solver, Solver_NU *solver_nu, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q) {
+    if(solver_nu) {
+        return Solver_NU__do_shrinking(solver, svc_q, one_class_q, svr_q);
+    }
+    return Solver__do_shrinking(solver, svc_q, one_class_q, svr_q);
+}
+void Solver__do_shrinking(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q)
 {
 	int i;
 	double Gmax1 = -INF;		// max { -y_i * grad(f)_i | i in I_up(\alpha) }
 	double Gmax2 = -INF;		// max { y_i * grad(f)_i | i in I_low(\alpha) }
 
 	// find maximal violating pair first
-	for(i=0;i<active_size;i++)
+	for(i=0;i<this->active_size;i++)
 	{
-		if(y[i]==+1)
+		if(this->y[i]==+1)
 		{
-			if(!is_upper_bound(i))
+			if(!Solver__is_upper_bound(this, i))
 			{
-				if(-G[i] >= Gmax1)
-					Gmax1 = -G[i];
+				if(-this->G[i] >= Gmax1)
+					Gmax1 = -this->G[i];
 			}
-			if(!is_lower_bound(i))
+			if(!Solver__is_lower_bound(this, i))
 			{
-				if(G[i] >= Gmax2)
-					Gmax2 = G[i];
+				if(this->G[i] >= Gmax2)
+					Gmax2 = this->G[i];
 			}
 		}
 		else
 		{
-			if(!is_upper_bound(i))
+			if(!Solver__is_upper_bound(this, i))
 			{
-				if(-G[i] >= Gmax2)
-					Gmax2 = -G[i];
+				if(-this->G[i] >= Gmax2)
+					Gmax2 = -this->G[i];
 			}
-			if(!is_lower_bound(i))
+			if(!Solver__is_lower_bound(this, i))
 			{
-				if(G[i] >= Gmax1)
-					Gmax1 = G[i];
+				if(this->G[i] >= Gmax1)
+					Gmax1 = this->G[i];
 			}
 		}
 	}
 
-	if(unshrink == false && Gmax1 + Gmax2 <= eps*10)
+	if(this->unshrink == false && Gmax1 + Gmax2 <= this->eps*10)
 	{
-		unshrink = true;
-		reconstruct_gradient();
-		active_size = l;
+        this->unshrink = true;
+        Solver__reconstruct_gradient(this, svc_q, one_class_q, svr_q);
+        this->active_size = this->l;
 		info("*");
 	}
 
-	for(i=0;i<active_size;i++)
-		if (be_shrunk(i, Gmax1, Gmax2))
+	for(i=0;i<this->active_size;i++)
+		if (Solver__be_shrunk(this, i, Gmax1, Gmax2))
 		{
-			active_size--;
-			while (active_size > i)
+            this->active_size--;
+			while (this->active_size > i)
 			{
-				if (!be_shrunk(active_size, Gmax1, Gmax2))
+				if (!Solver__be_shrunk(this, this->active_size, Gmax1, Gmax2))
 				{
-					swap_index(i,active_size);
+					Solver__swap_index(this, svc_q, one_class_q, svr_q, i,this->active_size);
 					break;
 				}
-				active_size--;
+                this->active_size--;
 			}
 		}
 }
 
-double Solver::calculate_rho()
+double Solver__calculate_rho(Solver* this);
+double Solver_NU__calculate_rho(Solver_NU* this);
+double Solver_virtual__calculate_rho(Solver *solver, Solver_NU *solver_nu) {
+    if(solver_nu) {
+        return Solver_NU__calculate_rho(solver_nu);
+    }
+    return Solver__calculate_rho(solver);
+}
+double Solver__calculate_rho(Solver* this)
 {
 	double r;
 	int nr_free = 0;
 	double ub = INF, lb = -INF, sum_free = 0;
-	for(int i=0;i<active_size;i++)
+	for(int i=0;i<this->active_size;i++)
 	{
-		double yG = y[i]*G[i];
+		double yG = this->y[i]*this->G[i];
 
-		if(is_upper_bound(i))
+		if(Solver__is_upper_bound(this, i))
 		{
-			if(y[i]==-1)
+			if(this->y[i]==-1)
 				ub = min(ub,yG);
 			else
 				lb = max(lb,yG);
 		}
-		else if(is_lower_bound(i))
+		else if(Solver__is_lower_bound(this, i))
 		{
-			if(y[i]==+1)
+			if(this->y[i]==+1)
 				ub = min(ub,yG);
 			else
 				lb = max(lb,yG);
@@ -1010,27 +1139,37 @@ double Solver::calculate_rho()
 //
 // additional constraint: e^T \alpha = constant
 //
-class Solver_NU: public Solver
+struct Solver_NU_extends_Solver_Struct
 {
-public:
-	Solver_NU() {}
-	void Solve(int l, const QMatrix& Q, const double *p, const schar *y,
-		   double *alpha, double Cp, double Cn, double eps,
-		   SolutionInfo* si, int shrinking)
-	{
-		this->si = si;
-		Solver::Solve(l,Q,p,y,alpha,Cp,Cn,eps,si,shrinking);
-	}
-private:
+    Solver *super;
+//public:
+//	Solver_NU() {}
+//	void Solve(int l, const QMatrix& Q, const double *p, const schar *y,
+//		   double *alpha, double Cp, double Cn, double eps,
+//		   SolutionInfo* si, int shrinking)
+//	{
+//		this->si = si;
+//		Solver::Solve(l,Q,p,y,alpha,Cp,Cn,eps,si,shrinking);
+//	}
+//private:
 	SolutionInfo *si;
-	int select_working_set(int &i, int &j);
-	double calculate_rho();
-	bool be_shrunk(int i, double Gmax1, double Gmax2, double Gmax3, double Gmax4);
-	void do_shrinking();
+//	int select_working_set(int &i, int &j);
+//	double calculate_rho();
+//	bool be_shrunk(int i, double Gmax1, double Gmax2, double Gmax3, double Gmax4);
+//	void do_shrinking();
 };
 
+void Solver_NU__Solve(Solver_NU* this, int l, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, const double *p, const schar *y,
+		   double *alpha, double Cp, double Cn, double eps,
+		   SolutionInfo* si, int shrinking) {
+    Solver* thisSolver = this->super;
+
+    this->si = si;
+    Solver__Solve(thisSolver, this, l,svc_q, one_class_q, svr_q,p,y,alpha,Cp,Cn,eps,si,shrinking);
+}
+
 // return 1 if already optimal, return 0 otherwise
-int Solver_NU::select_working_set(int &out_i, int &out_j)
+int Solver_NU__select_working_set(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q, int *out_i, int *out_j)
 {
 	// return i,j such that y_i = y_j and
 	// i: maximizes -y_i * grad(f)_i, i in I_up(\alpha)
@@ -1049,22 +1188,22 @@ int Solver_NU::select_working_set(int &out_i, int &out_j)
 	int Gmin_idx = -1;
 	double obj_diff_min = INF;
 
-	for(int t=0;t<active_size;t++)
-		if(y[t]==+1)
+	for(int t=0;t<this->active_size;t++)
+		if(this->y[t]==+1)
 		{
-			if(!is_upper_bound(t))
-				if(-G[t] >= Gmaxp)
+			if(!Solver__is_upper_bound(this, t))
+				if(-this->G[t] >= Gmaxp)
 				{
-					Gmaxp = -G[t];
+					Gmaxp = -this->G[t];
 					Gmaxp_idx = t;
 				}
 		}
 		else
 		{
-			if(!is_lower_bound(t))
-				if(G[t] >= Gmaxn)
+			if(!Solver__is_lower_bound(this, t))
+				if(this->G[t] >= Gmaxn)
 				{
-					Gmaxn = G[t];
+					Gmaxn = this->G[t];
 					Gmaxn_idx = t;
 				}
 		}
@@ -1074,23 +1213,23 @@ int Solver_NU::select_working_set(int &out_i, int &out_j)
 	const Qfloat *Q_ip = NULL;
 	const Qfloat *Q_in = NULL;
 	if(ip != -1) // NULL Q_ip not accessed: Gmaxp=-INF if ip=-1
-		Q_ip = Q->get_Q(ip,active_size);
+		Q_ip = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q, ip,this->active_size);
 	if(in != -1)
-		Q_in = Q->get_Q(in,active_size);
+		Q_in = QMatrix_virtual__get_Q(svc_q, one_class_q, svr_q, in,this->active_size);
 
-	for(int j=0;j<active_size;j++)
+	for(int j=0;j<this->active_size;j++)
 	{
-		if(y[j]==+1)
+		if(this->y[j]==+1)
 		{
-			if (!is_lower_bound(j))
+			if (!Solver__is_lower_bound(this, j))
 			{
-				double grad_diff=Gmaxp+G[j];
-				if (G[j] >= Gmaxp2)
-					Gmaxp2 = G[j];
+				double grad_diff=Gmaxp+this->G[j];
+				if (this->G[j] >= Gmaxp2)
+					Gmaxp2 = this->G[j];
 				if (grad_diff > 0)
 				{
 					double obj_diff;
-					double quad_coef = QD[ip]+QD[j]-2*Q_ip[j];
+					double quad_coef = this->QD[ip]+this->QD[j]-2*Q_ip[j];
 					if (quad_coef > 0)
 						obj_diff = -(grad_diff*grad_diff)/quad_coef;
 					else
@@ -1106,15 +1245,15 @@ int Solver_NU::select_working_set(int &out_i, int &out_j)
 		}
 		else
 		{
-			if (!is_upper_bound(j))
+			if (!Solver__is_upper_bound(this, j))
 			{
-				double grad_diff=Gmaxn-G[j];
-				if (-G[j] >= Gmaxn2)
-					Gmaxn2 = -G[j];
+				double grad_diff=Gmaxn-this->G[j];
+				if (-this->G[j] >= Gmaxn2)
+					Gmaxn2 = -this->G[j];
 				if (grad_diff > 0)
 				{
 					double obj_diff;
-					double quad_coef = QD[in]+QD[j]-2*Q_in[j];
+					double quad_coef = this->QD[in]+this->QD[j]-2*Q_in[j];
 					if (quad_coef > 0)
 						obj_diff = -(grad_diff*grad_diff)/quad_coef;
 					else
@@ -1130,39 +1269,39 @@ int Solver_NU::select_working_set(int &out_i, int &out_j)
 		}
 	}
 
-	if(max(Gmaxp+Gmaxp2,Gmaxn+Gmaxn2) < eps || Gmin_idx == -1)
+	if(max(Gmaxp+Gmaxp2,Gmaxn+Gmaxn2) < this->eps || Gmin_idx == -1)
 		return 1;
 
-	if (y[Gmin_idx] == +1)
-		out_i = Gmaxp_idx;
+	if (this->y[Gmin_idx] == +1)
+		*out_i = Gmaxp_idx;
 	else
-		out_i = Gmaxn_idx;
-	out_j = Gmin_idx;
+		*out_i = Gmaxn_idx;
+	*out_j = Gmin_idx;
 
 	return 0;
 }
 
-bool Solver_NU::be_shrunk(int i, double Gmax1, double Gmax2, double Gmax3, double Gmax4)
+bool Solver_NU__be_shrunk(Solver* this, int i, double Gmax1, double Gmax2, double Gmax3, double Gmax4)
 {
-	if(is_upper_bound(i))
+	if(Solver__is_upper_bound(this, i))
 	{
-		if(y[i]==+1)
-			return(-G[i] > Gmax1);
+		if(this->y[i]==+1)
+			return(-this->G[i] > Gmax1);
 		else
-			return(-G[i] > Gmax4);
+			return(-this->G[i] > Gmax4);
 	}
-	else if(is_lower_bound(i))
+	else if(Solver__is_lower_bound(this, i))
 	{
-		if(y[i]==+1)
-			return(G[i] > Gmax2);
+		if(this->y[i]==+1)
+			return(this->G[i] > Gmax2);
 		else
-			return(G[i] > Gmax3);
+			return(this->G[i] > Gmax3);
 	}
 	else
 		return(false);
 }
 
-void Solver_NU::do_shrinking()
+void Solver_NU__do_shrinking(Solver* this, SVC_Q *svc_q, ONE_CLASS_Q *one_class_q, SVR_Q *svr_q)
 {
 	double Gmax1 = -INF;	// max { -y_i * grad(f)_i | y_i = +1, i in I_up(\alpha) }
 	double Gmax2 = -INF;	// max { y_i * grad(f)_i | y_i = +1, i in I_low(\alpha) }
@@ -1171,80 +1310,80 @@ void Solver_NU::do_shrinking()
 
 	// find maximal violating pair first
 	int i;
-	for(i=0;i<active_size;i++)
+	for(i=0;i<this->active_size;i++)
 	{
-		if(!is_upper_bound(i))
+		if(!Solver__is_upper_bound(this, i))
 		{
-			if(y[i]==+1)
+			if(this->y[i]==+1)
 			{
-				if(-G[i] > Gmax1) Gmax1 = -G[i];
+				if(-this->G[i] > Gmax1) Gmax1 = -this->G[i];
 			}
-			else	if(-G[i] > Gmax4) Gmax4 = -G[i];
+			else	if(-this->G[i] > Gmax4) Gmax4 = -this->G[i];
 		}
-		if(!is_lower_bound(i))
+		if(!Solver__is_lower_bound(this, i))
 		{
-			if(y[i]==+1)
+			if(this->y[i]==+1)
 			{
-				if(G[i] > Gmax2) Gmax2 = G[i];
+				if(this->G[i] > Gmax2) Gmax2 = this->G[i];
 			}
-			else	if(G[i] > Gmax3) Gmax3 = G[i];
+			else	if(this->G[i] > Gmax3) Gmax3 = this->G[i];
 		}
 	}
 
-	if(unshrink == false && max(Gmax1+Gmax2,Gmax3+Gmax4) <= eps*10)
+	if(this->unshrink == false && max(Gmax1+Gmax2,Gmax3+Gmax4) <= this->eps*10)
 	{
-		unshrink = true;
-		reconstruct_gradient();
-		active_size = l;
+        this->unshrink = true;
+        Solver__reconstruct_gradient(this, svc_q, one_class_q, svr_q);
+        this->active_size = this->l;
 	}
 
-	for(i=0;i<active_size;i++)
-		if (be_shrunk(i, Gmax1, Gmax2, Gmax3, Gmax4))
+	for(i=0;i<this->active_size;i++)
+		if (Solver_NU__be_shrunk(this, i, Gmax1, Gmax2, Gmax3, Gmax4))
 		{
-			active_size--;
-			while (active_size > i)
+            this->active_size--;
+			while (this->active_size > i)
 			{
-				if (!be_shrunk(active_size, Gmax1, Gmax2, Gmax3, Gmax4))
+				if (!Solver_NU__be_shrunk(this, this->active_size, Gmax1, Gmax2, Gmax3, Gmax4))
 				{
-					swap_index(i,active_size);
+                    Solver__swap_index(this, svc_q, one_class_q, svr_q, i,this->active_size);
 					break;
 				}
-				active_size--;
+                this->active_size--;
 			}
 		}
 }
 
-double Solver_NU::calculate_rho()
+double Solver_NU__calculate_rho(Solver_NU* this)
 {
 	int nr_free1 = 0,nr_free2 = 0;
 	double ub1 = INF, ub2 = INF;
 	double lb1 = -INF, lb2 = -INF;
 	double sum_free1 = 0, sum_free2 = 0;
 
-	for(int i=0;i<active_size;i++)
+	for(int i=0;i<this->super->active_size;i++)
 	{
-		if(y[i]==+1)
+		if(this->super->y[i]==+1)
 		{
-			if(is_upper_bound(i))
-				lb1 = max(lb1,G[i]);
-			else if(is_lower_bound(i))
-				ub1 = min(ub1,G[i]);
+			if(Solver__is_upper_bound(this->super, i))
+				lb1 = max(lb1,this->super->G[i]);
+			else if(Solver__is_lower_bound(this->super, i))
+				ub1 = min(ub1,this->super->G[i]);
 			else
 			{
 				++nr_free1;
-				sum_free1 += G[i];
+				sum_free1 += this->super->G[i];
 			}
 		}
 		else
 		{
-			if(is_upper_bound(i))
-				lb2 = max(lb2,G[i]);
-			else if(is_lower_bound(i))
-				ub2 = min(ub2,G[i]);
+			if(Solver__is_upper_bound(this->super, i))
+				lb2 = max(lb2,this->super->G[i]);
+			else if(Solver__is_lower_bound(this->super, i))
+				ub2 = min(ub2,this->super->G[i]);
 			else
 			{
 				++nr_free2;
-				sum_free2 += G[i];
+				sum_free2 += this->super->G[i];
 			}
 		}
 	}
@@ -1260,200 +1399,371 @@ double Solver_NU::calculate_rho()
 	else
 		r2 = (ub2+lb2)/2;
 
-	si->r = (r1+r2)/2;
+	this->si->r = (r1+r2)/2;
 	return (r1-r2)/2;
 }
 
 //
 // Q matrices for various formulations
 //
-class SVC_Q: public Kernel
+struct SVC_Q_extends_Kernel_Struct
 {
-public:
-	SVC_Q(const svm_problem& prob, const svm_parameter& param, const schar *y_)
-	:Kernel(prob.l, prob.x, param)
-	{
-		clone(y,y_,prob.l);
-		cache = new Cache(prob.l,(long int)(param.cache_size*(1<<20)));
-		QD = new double[prob.l];
-		for(int i=0;i<prob.l;i++)
-			QD[i] = (this->*kernel_function)(i,i);
-	}
+    Kernel *superKernel;
+//public:
+//	SVC_Q(const svm_problem& prob, const svm_parameter& param, const schar *y_)
+//	:Kernel(prob.l, prob.x, param)
+//	{
+//		clone(y,y_,prob.l);
+//		cache = new Cache(prob.l,(long int)(param.cache_size*(1<<20)));
+//		QD = new double[prob.l];
+//		for(int i=0;i<prob.l;i++)
+//			QD[i] = (this->*kernel_function)(i,i);
+//	}
+//
+//	Qfloat *get_Q(int i, int len) const
+//	{
+//		Qfloat *data;
+//		int start, j;
+//		if((start = cache->get_data(i,&data,len)) < len)
+//		{
+//#ifdef _OPENMP
+//#pragma omp parallel for private(j) schedule(guided)
+//#endif
+//			for(j=start;j<len;j++)
+//				data[j] = (Qfloat)(y[i]*y[j]*(this->*kernel_function)(i,j));
+//		}
+//		return data;
+//	}
+//
+//	double *get_QD() const
+//	{
+//		return QD;
+//	}
+//
+//	void swap_index(int i, int j) const
+//	{
+//		cache->swap_index(i,j);
+//		Kernel::swap_index(i,j);
+//		swap(y[i],y[j]);
+//		swap(QD[i],QD[j]);
+//	}
 
-	Qfloat *get_Q(int i, int len) const
-	{
-		Qfloat *data;
-		int start, j;
-		if((start = cache->get_data(i,&data,len)) < len)
-		{
-#ifdef _OPENMP
-#pragma omp parallel for private(j) schedule(guided)
-#endif
-			for(j=start;j<len;j++)
-				data[j] = (Qfloat)(y[i]*y[j]*(this->*kernel_function)(i,j));
-		}
-		return data;
-	}
-
-	double *get_QD() const
-	{
-		return QD;
-	}
-
-	void swap_index(int i, int j) const
-	{
-		cache->swap_index(i,j);
-		Kernel::swap_index(i,j);
-		swap(y[i],y[j]);
-		swap(QD[i],QD[j]);
-	}
-
-	~SVC_Q()
-	{
-		delete[] y;
-		delete cache;
-		delete[] QD;
-	}
-private:
+//	~SVC_Q()
+//	{
+//		delete[] y;
+//		delete cache;
+//		delete[] QD;
+//	}
+//private:
 	schar *y;
 	Cache *cache;
 	double *QD;
 };
 
-class ONE_CLASS_Q: public Kernel
+SVC_Q* SVC_Q__new(const svm_problem* prob, const svm_parameter* param, const schar *y_) {
+    Kernel* thisKernel = Kernel__new(prob->l, prob->x, *param);
+
+    SVC_Q* this = malloc(sizeof(SVC_Q));this->superKernel=thisKernel;
+    clone(this->y,y_,prob->l);
+    this->cache = Cache__new(prob->l,(long int)(param->cache_size*(1<<20)));
+    this->QD = malloc(sizeof(double) * prob->l);
+    for(int i=0;i<prob->l;i++)
+        this->QD[i] = (*thisKernel->kernel_function)(thisKernel, i,i);
+
+    return this;
+}
+
+Qfloat *SVC_Q__get_Q(SVC_Q* this, int i, int len) {
+    Kernel* thisKernel = this->superKernel;
+
+    Qfloat *data;
+    int start, j;
+    if((start = Cache__get_data(this->cache, i,&data,len)) < len)
+    {
+#ifdef _OPENMP
+#pragma omp parallel for private(j) schedule(guided)
+#endif
+        for(j=start;j<len;j++)
+            data[j] = (Qfloat)(this->y[i]*this->y[j]*(*thisKernel->kernel_function)(thisKernel, i,j));
+    }
+    return data;
+}
+
+double *SVC_Q__get_QD(SVC_Q* this) {
+    return this->QD;
+}
+
+void SVC_Q__swap_index(SVC_Q* this, int i, int j)
 {
-public:
-	ONE_CLASS_Q(const svm_problem& prob, const svm_parameter& param)
-	:Kernel(prob.l, prob.x, param)
-	{
-		cache = new Cache(prob.l,(long int)(param.cache_size*(1<<20)));
-		QD = new double[prob.l];
-		for(int i=0;i<prob.l;i++)
-			QD[i] = (this->*kernel_function)(i,i);
-	}
+    Kernel* thisKernel = this->superKernel;
 
-	Qfloat *get_Q(int i, int len) const
-	{
-		Qfloat *data;
-		int start, j;
-		if((start = cache->get_data(i,&data,len)) < len)
-		{
-			for(j=start;j<len;j++)
-				data[j] = (Qfloat)(this->*kernel_function)(i,j);
-		}
-		return data;
-	}
+    Cache__swap_index(this->cache, i,j);
+    Kernel__swap_index(thisKernel, i,j);
+    swap(this->y[i],this->y[j]);
+    swap(this->QD[i],this->QD[j]);
+}
 
-	double *get_QD() const
-	{
-		return QD;
-	}
+void SVC_Q__destructor(SVC_Q* this) {
+    free(this->y);
+    free(this->cache);
+    free(this->QD);
+}
 
-	void swap_index(int i, int j) const
-	{
-		cache->swap_index(i,j);
-		Kernel::swap_index(i,j);
-		swap(QD[i],QD[j]);
-	}
 
-	~ONE_CLASS_Q()
-	{
-		delete cache;
-		delete[] QD;
-	}
-private:
+struct ONE_CLASS_Q_extends_Kernel_Struct
+{
+    Kernel *superKernel;
+//public:
+//	ONE_CLASS_Q(const svm_problem& prob, const svm_parameter& param)
+//	:Kernel(prob.l, prob.x, param)
+//	{
+//		cache = new Cache(prob.l,(long int)(param.cache_size*(1<<20)));
+//		QD = new double[prob.l];
+//		for(int i=0;i<prob.l;i++)
+//			QD[i] = (this->*kernel_function)(i,i);
+//	}
+//
+//	Qfloat *get_Q(int i, int len) const
+//	{
+//		Qfloat *data;
+//		int start, j;
+//		if((start = cache->get_data(i,&data,len)) < len)
+//		{
+//			for(j=start;j<len;j++)
+//				data[j] = (Qfloat)(this->*kernel_function)(i,j);
+//		}
+//		return data;
+//	}
+//
+//	double *get_QD() const
+//	{
+//		return QD;
+//	}
+
+//	void swap_index(int i, int j) const
+//	{
+//		cache->swap_index(i,j);
+//		Kernel::swap_index(i,j);
+//		swap(QD[i],QD[j]);
+//	}
+
+//	~ONE_CLASS_Q()
+//	{
+//		delete cache;
+//		delete[] QD;
+//	}
+//private:
 	Cache *cache;
 	double *QD;
 };
 
-class SVR_Q: public Kernel
+ONE_CLASS_Q* ONE_CLASS_Q__new(const svm_problem* prob, const svm_parameter* param) {
+    Kernel* thisKernel = Kernel__new(prob->l, prob->x, *param);
+
+    ONE_CLASS_Q* this = malloc(sizeof(ONE_CLASS_Q));this->superKernel=thisKernel;
+    this->cache = Cache__new(prob->l,(long int)(param->cache_size*(1<<20)));
+    this->QD = Malloc(double, prob->l);
+    for(int i=0;i<prob->l;i++)
+        this->QD[i] = (*thisKernel->kernel_function)(thisKernel, i,i);
+
+    return this;
+}
+
+Qfloat *ONE_CLASS_Q__get_Q(ONE_CLASS_Q* this, int i, int len)
 {
-public:
-	SVR_Q(const svm_problem& prob, const svm_parameter& param)
-	:Kernel(prob.l, prob.x, param)
-	{
-		l = prob.l;
-		cache = new Cache(l,(long int)(param.cache_size*(1<<20)));
-		QD = new double[2*l];
-		sign = new schar[2*l];
-		index = new int[2*l];
-		for(int k=0;k<l;k++)
-		{
-			sign[k] = 1;
-			sign[k+l] = -1;
-			index[k] = k;
-			index[k+l] = k;
-			QD[k] = (this->*kernel_function)(k,k);
-			QD[k+l] = QD[k];
-		}
-		buffer[0] = new Qfloat[2*l];
-		buffer[1] = new Qfloat[2*l];
-		next_buffer = 0;
-	}
+    Kernel* thisKernel = this->superKernel;
 
-	void swap_index(int i, int j) const
-	{
-		swap(sign[i],sign[j]);
-		swap(index[i],index[j]);
-		swap(QD[i],QD[j]);
-	}
+    Qfloat *data;
+    int start, j;
+    if((start = Cache__get_data(this->cache, i,&data,len)) < len)
+    {
+        for(j=start;j<len;j++)
+            data[j] = (Qfloat)(*thisKernel->kernel_function)(thisKernel, i,j);
+    }
+    return data;
+}
 
-	Qfloat *get_Q(int i, int len) const
-	{
-		Qfloat *data;
-		int j, real_i = index[i];
-		if(cache->get_data(real_i,&data,l) < l)
-		{
-#ifdef _OPENMP
-#pragma omp parallel for private(j) schedule(guided)
-#endif
-			for(j=0;j<l;j++)
-				data[j] = (Qfloat)(this->*kernel_function)(real_i,j);
-		}
+double *ONE_CLASS_Q__get_QD(ONE_CLASS_Q* this)
+{
+    return this->QD;
+}
 
-		// reorder and copy
-		Qfloat *buf = buffer[next_buffer];
-		next_buffer = 1 - next_buffer;
-		schar si = sign[i];
-		for(j=0;j<len;j++)
-			buf[j] = (Qfloat) si * (Qfloat) sign[j] * data[index[j]];
-		return buf;
-	}
+void ONE_CLASS_Q__swap_index(ONE_CLASS_Q* this, int i, int j) {
+    Kernel* thisKernel = this->superKernel;
 
-	double *get_QD() const
-	{
-		return QD;
-	}
+    Cache__swap_index(this->cache, i,j);
+    Kernel__swap_index(thisKernel, i,j);
+    swap(this->QD[i],this->QD[j]);
+}
 
-	~SVR_Q()
-	{
-		delete cache;
-		delete[] sign;
-		delete[] index;
-		delete[] buffer[0];
-		delete[] buffer[1];
-		delete[] QD;
-	}
-private:
+void ONE_CLASS_Q__destructor(ONE_CLASS_Q* this) {
+    free(this->cache);
+    free(this->QD);
+}
+
+
+struct SVR_Q_extends_Kernel_Struct
+{
+    Kernel *superKernel;
+//public:
+//	SVR_Q(const svm_problem& prob, const svm_parameter& param)
+//	:Kernel(prob.l, prob.x, param)
+//	{
+//		l = prob.l;
+//		cache = new Cache(l,(long int)(param.cache_size*(1<<20)));
+//		QD = new double[2*l];
+//		sign = new schar[2*l];
+//		index = new int[2*l];
+//		for(int k=0;k<l;k++)
+//		{
+//			sign[k] = 1;
+//			sign[k+l] = -1;
+//			index[k] = k;
+//			index[k+l] = k;
+//			QD[k] = (this->*kernel_function)(k,k);
+//			QD[k+l] = QD[k];
+//		}
+//		buffer[0] = new Qfloat[2*l];
+//		buffer[1] = new Qfloat[2*l];
+//		next_buffer = 0;
+//	}
+
+//	void swap_index(int i, int j) const
+//	{
+//		swap(sign[i],sign[j]);
+//		swap(index[i],index[j]);
+//		swap(QD[i],QD[j]);
+//	}
+
+//	Qfloat *get_Q(int i, int len) const
+//	{
+//		Qfloat *data;
+//		int j, real_i = index[i];
+//		if(cache->get_data(real_i,&data,l) < l)
+//		{
+//#ifdef _OPENMP
+//#pragma omp parallel for private(j) schedule(guided)
+//#endif
+//			for(j=0;j<l;j++)
+//				data[j] = (Qfloat)(this->*kernel_function)(real_i,j);
+//		}
+//
+//		// reorder and copy
+//		Qfloat *buf = buffer[next_buffer];
+//		next_buffer = 1 - next_buffer;
+//		schar si = sign[i];
+//		for(j=0;j<len;j++)
+//			buf[j] = (Qfloat) si * (Qfloat) sign[j] * data[index[j]];
+//		return buf;
+//	}
+
+//	double *get_QD() const
+//	{
+//		return QD;
+//	}
+
+//	~SVR_Q()
+//	{
+//		delete cache;
+//		delete[] sign;
+//		delete[] index;
+//		delete[] buffer[0];
+//		delete[] buffer[1];
+//		delete[] QD;
+//	}
+//private:
 	int l;
 	Cache *cache;
 	schar *sign;
 	int *index;
-	mutable int next_buffer;
+    int next_buffer;
 	Qfloat *buffer[2];
 	double *QD;
 };
 
+SVR_Q* SVR_Q__new(const svm_problem* prob, const svm_parameter* param)
+{
+    Kernel* thisKernel = Kernel__new(prob->l, prob->x, *param);
+
+    SVR_Q* this = malloc(sizeof(SVR_Q));this->superKernel=thisKernel;
+    this->l = prob->l;
+    this->cache = Cache__new(this->l,(long int)(param->cache_size*(1<<20)));
+    this->QD = Malloc(double, 2*this->l);
+    this->sign = Malloc(schar, 2*this->l);
+    this->index = Malloc(int, 2*this->l);
+    for(int k=0;k<this->l;k++)
+    {
+        this->sign[k] = 1;
+        this->sign[k+this->l] = -1;
+        this->index[k] = k;
+        this->index[k+this->l] = k;
+        this->QD[k] = (*thisKernel->kernel_function)(thisKernel, k,k);
+        this->QD[k+this->l] = this->QD[k];
+    }
+    this->buffer[0] = Malloc(Qfloat, 2*this->l);
+    this->buffer[1] = Malloc(Qfloat, 2*this->l);
+    this->next_buffer = 0;
+
+    return this;
+}
+
+void SVR_Q__swap_index(SVR_Q* this, int i, int j)
+{
+    swap(this->sign[i],this->sign[j]);
+    swap(this->index[i],this->index[j]);
+    swap(this->QD[i],this->QD[j]);
+}
+
+Qfloat *SVR_Q__get_Q(SVR_Q* this, int i, int len)
+{
+    Kernel* thisKernel = this->superKernel;
+
+    Qfloat *data;
+    int j, real_i = this->index[i];
+    if(Cache__get_data(this->cache, real_i,&data,this->l) < this->l)
+{
+#ifdef _OPENMP
+#pragma omp parallel for private(j) schedule(guided)
+#endif
+    for(j=0;j<this->l;j++)
+    data[j] = (Qfloat)(*thisKernel->kernel_function)(thisKernel, real_i,j);
+    }
+
+    // reorder and copy
+    Qfloat *buf = this->buffer[this->next_buffer];
+    this->next_buffer = 1 - this->next_buffer;
+    schar si = this->sign[i];
+    for(j=0;j<len;j++)
+        buf[j] = (Qfloat) si * (Qfloat) this->sign[j] * data[this->index[j]];
+    return buf;
+}
+
+double *SVR_Q__get_QD(SVR_Q* this)
+{
+    return this->QD;
+}
+
+void SVR_Q__destructor(SVR_Q* this)
+{
+    free(this->cache);
+    free(this->sign);
+    free(this->index);
+    free(this->buffer[0]);
+    free(this->buffer[1]);
+    free(this->QD);
+}
+
 //
 // construct and solve various formulations
 //
+typedef SolutionInfo Solver__SolutionInfo;
 static void solve_c_svc(
 	const svm_problem *prob, const svm_parameter* param,
-	double *alpha, Solver::SolutionInfo* si, double Cp, double Cn)
+	double *alpha, Solver__SolutionInfo* si, double Cp, double Cn)
 {
 	int l = prob->l;
-	double *minus_ones = new double[l];
-	schar *y = new schar[l];
+	double *minus_ones = Malloc(double, l);
+	schar *y = Malloc(schar, l);
 
 	int i;
 
@@ -1464,8 +1774,9 @@ static void solve_c_svc(
 		if(prob->y[i] > 0) y[i] = +1; else y[i] = -1;
 	}
 
+    SVC_Q* svc_q = SVC_Q__new(prob,param,y);
 	Solver s;
-	s.Solve(l, SVC_Q(*prob,*param,y), minus_ones, y,
+	Solver__Solve(&s, NULL, l, svc_q, NULL, NULL, minus_ones, y,
 		alpha, Cp, Cn, param->eps, si, param->shrinking);
 
 	double sum_alpha=0;
@@ -1478,19 +1789,19 @@ static void solve_c_svc(
 	for(i=0;i<l;i++)
 		alpha[i] *= y[i];
 
-	delete[] minus_ones;
-	delete[] y;
+	free(minus_ones);
+    free(y);
 }
 
 static void solve_nu_svc(
 	const svm_problem *prob, const svm_parameter *param,
-	double *alpha, Solver::SolutionInfo* si)
+	double *alpha, Solver__SolutionInfo* si)
 {
 	int i;
 	int l = prob->l;
 	double nu = param->nu;
 
-	schar *y = new schar[l];
+	schar *y = Malloc(schar, l);
 
 	for(i=0;i<l;i++)
 		if(prob->y[i]>0)
@@ -1513,13 +1824,14 @@ static void solve_nu_svc(
 			sum_neg -= alpha[i];
 		}
 
-	double *zeros = new double[l];
+	double *zeros = Malloc(double, l);
 
 	for(i=0;i<l;i++)
 		zeros[i] = 0;
 
-	Solver_NU s;
-	s.Solve(l, SVC_Q(*prob,*param,y), zeros, y,
+    SVC_Q* svc_q = SVC_Q__new(prob,param,y);
+	Solver_NU s;s.super = Malloc(Solver, 1);
+    Solver_NU__Solve(&s, l, svc_q, NULL, NULL, zeros, y,
 		alpha, 1.0, 1.0, param->eps, si,  param->shrinking);
 	double r = si->r;
 
@@ -1533,17 +1845,17 @@ static void solve_nu_svc(
 	si->upper_bound_p = 1/r;
 	si->upper_bound_n = 1/r;
 
-	delete[] y;
-	delete[] zeros;
+	free(y);
+    free(zeros);
 }
 
 static void solve_one_class(
 	const svm_problem *prob, const svm_parameter *param,
-	double *alpha, Solver::SolutionInfo* si)
+	double *alpha, Solver__SolutionInfo* si)
 {
 	int l = prob->l;
-	double *zeros = new double[l];
-	schar *ones = new schar[l];
+	double *zeros = Malloc(double, l);
+	schar *ones = Malloc(schar, l);
 	int i;
 
 	int n = (int)(param->nu*prob->l);	// # of alpha's at upper bound
@@ -1561,22 +1873,23 @@ static void solve_one_class(
 		ones[i] = 1;
 	}
 
+    ONE_CLASS_Q* one_class_q = ONE_CLASS_Q__new(prob,param);
 	Solver s;
-	s.Solve(l, ONE_CLASS_Q(*prob,*param), zeros, ones,
+    Solver__Solve(&s, NULL, l, NULL, one_class_q, NULL, zeros, ones,
 		alpha, 1.0, 1.0, param->eps, si, param->shrinking);
 
-	delete[] zeros;
-	delete[] ones;
+	free(zeros);
+	free(ones);
 }
 
 static void solve_epsilon_svr(
 	const svm_problem *prob, const svm_parameter *param,
-	double *alpha, Solver::SolutionInfo* si)
+	double *alpha, Solver__SolutionInfo* si)
 {
 	int l = prob->l;
-	double *alpha2 = new double[2*l];
-	double *linear_term = new double[2*l];
-	schar *y = new schar[2*l];
+	double *alpha2 = Malloc(double, 2*l);
+	double *linear_term = Malloc(double, 2*l);
+	schar *y = Malloc(schar, 2*l);
 	int i;
 
 	for(i=0;i<l;i++)
@@ -1590,8 +1903,9 @@ static void solve_epsilon_svr(
 		y[i+l] = -1;
 	}
 
+    SVR_Q* svr_q = SVR_Q__new(prob,param);
 	Solver s;
-	s.Solve(2*l, SVR_Q(*prob,*param), linear_term, y,
+    Solver__Solve(&s, NULL, 2*l, NULL, NULL, svr_q, linear_term, y,
 		alpha2, param->C, param->C, param->eps, si, param->shrinking);
 
 	double sum_alpha = 0;
@@ -1602,20 +1916,20 @@ static void solve_epsilon_svr(
 	}
 	info("nu = %f\n",sum_alpha/(param->C*l));
 
-	delete[] alpha2;
-	delete[] linear_term;
-	delete[] y;
+	free(alpha2);
+    free(linear_term);
+    free(y);
 }
 
 static void solve_nu_svr(
 	const svm_problem *prob, const svm_parameter *param,
-	double *alpha, Solver::SolutionInfo* si)
+	double *alpha, Solver__SolutionInfo* si)
 {
 	int l = prob->l;
 	double C = param->C;
-	double *alpha2 = new double[2*l];
-	double *linear_term = new double[2*l];
-	schar *y = new schar[2*l];
+	double *alpha2 = Malloc(double, 2*l);
+	double *linear_term = Malloc(double, 2*l);
+	schar *y = Malloc(schar, 2*l);
 	int i;
 
 	double sum = C * param->nu * l / 2;
@@ -1631,8 +1945,9 @@ static void solve_nu_svr(
 		y[i+l] = -1;
 	}
 
-	Solver_NU s;
-	s.Solve(2*l, SVR_Q(*prob,*param), linear_term, y,
+    SVR_Q* svr_q = SVR_Q__new(prob,param);
+	Solver_NU s;s.super = Malloc(Solver, 1);
+    Solver_NU__Solve(&s, 2*l, NULL, NULL, svr_q, linear_term, y,
 		alpha2, C, C, param->eps, si, param->shrinking);
 
 	info("epsilon = %f\n",-si->r);
@@ -1640,15 +1955,16 @@ static void solve_nu_svr(
 	for(i=0;i<l;i++)
 		alpha[i] = alpha2[i] - alpha2[i+l];
 
-	delete[] alpha2;
-	delete[] linear_term;
-	delete[] y;
+    free(alpha2);
+    free(linear_term);
+    free(y);
 }
 
 //
 // decision_function
 //
-struct decision_function
+typedef struct decision_function_Struct decision_function;
+struct decision_function_Struct
 {
 	double *alpha;
 	double rho;
@@ -1659,7 +1975,7 @@ static decision_function svm_train_one(
 	double Cp, double Cn)
 {
 	double *alpha = Malloc(double,prob->l);
-	Solver::SolutionInfo si;
+	Solver__SolutionInfo si;
 	switch(param->svm_type)
 	{
 		case C_SVC:
@@ -1714,7 +2030,7 @@ static decision_function svm_train_one(
 // Platt's binary SVM Probablistic Output: an improvement from Lin et al.
 static void sigmoid_train(
 	int l, const double *dec_values, const double *labels,
-	double& A, double& B)
+	double* A, double* B)
 {
 	double prior1=0, prior0 = 0;
 	int i;
@@ -1735,14 +2051,14 @@ static void sigmoid_train(
 	int iter;
 
 	// Initial Point and Initial Fun Value
-	A=0.0; B=log((prior0+1.0)/(prior1+1.0));
+	*A=0.0; *B=log((prior0+1.0)/(prior1+1.0));
 	double fval = 0.0;
 
 	for (i=0;i<l;i++)
 	{
 		if (labels[i]>0) t[i]=hiTarget;
 		else t[i]=loTarget;
-		fApB = dec_values[i]*A+B;
+		fApB = dec_values[i]*(*A)+(*B);
 		if (fApB>=0)
 			fval += t[i]*fApB + log(1+exp(-fApB));
 		else
@@ -1756,7 +2072,7 @@ static void sigmoid_train(
 		h21=0.0;g1=0.0;g2=0.0;
 		for (i=0;i<l;i++)
 		{
-			fApB = dec_values[i]*A+B;
+			fApB = dec_values[i]*(*A)+(*B);
 			if (fApB >= 0)
 			{
 				p=exp(-fApB)/(1.0+exp(-fApB));
@@ -1790,8 +2106,8 @@ static void sigmoid_train(
 		stepsize = 1;		// Line Search
 		while (stepsize >= min_step)
 		{
-			newA = A + stepsize * dA;
-			newB = B + stepsize * dB;
+			newA = *A + stepsize * dA;
+			newB = *B + stepsize * dB;
 
 			// New function value
 			newf = 0.0;
@@ -1806,7 +2122,7 @@ static void sigmoid_train(
 			// Check sufficient decrease
 			if (newf<fval+0.0001*stepsize*gd)
 			{
-				A=newA;B=newB;fval=newf;
+                *A=newA;*B=newB;fval=newf;
 				break;
 			}
 			else
@@ -1902,7 +2218,7 @@ static void multiclass_probability(int k, double **r, double *p)
 // Using cross-validation decision values to get parameters for SVC probability estimates
 static void svm_binary_svc_probability(
 	const svm_problem *prob, const svm_parameter *param,
-	double Cp, double Cn, double& probA, double& probB)
+	double Cp, double Cn, double* probA, double* probB)
 {
 	int i;
 	int nr_fold = 5;
@@ -2310,7 +2626,7 @@ svm_model *svm_train(const svm_problem *prob, const svm_parameter *param)
 				}
 
 				if(param->probability)
-					svm_binary_svc_probability(&sub_prob,param,weighted_C[i],weighted_C[j],probA[p],probB[p]);
+					svm_binary_svc_probability(&sub_prob,param,weighted_C[i],weighted_C[j],&probA[p],&probB[p]);
 
 				f[p] = svm_train_one(&sub_prob,param,weighted_C[i],weighted_C[j]);
 				for(k=0;k<ci;k++)
@@ -2610,7 +2926,7 @@ double svm_predict_values(const svm_model *model, const svm_node *x, double* dec
 #pragma omp parallel for private(i) reduction(+:sum) schedule(guided)
 #endif
 		for(i=0;i<model->l;i++)
-			sum += sv_coef[i] * Kernel::k_function(x,model->SV[i],model->param);
+			sum += sv_coef[i] * Kernel__k_function(x,model->SV[i],model->param);
 		sum -= model->rho[0];
 		*dec_values = sum;
 
@@ -2629,7 +2945,7 @@ double svm_predict_values(const svm_model *model, const svm_node *x, double* dec
 #pragma omp parallel for private(i) schedule(guided)
 #endif
 		for(i=0;i<l;i++)
-			kvalue[i] = Kernel::k_function(x,model->SV[i],model->param);
+			kvalue[i] = Kernel__k_function(x,model->SV[i],model->param);
 
 		int *start = Malloc(int,nr_class);
 		start[0] = 0;
@@ -2768,7 +3084,7 @@ int svm_save_model(const char *model_file_name, const svm_model *model)
 	}
 	setlocale(LC_ALL, "C");
 
-	const svm_parameter& param = model->param;
+	const svm_parameter param = model->param;
 
 	fprintf(fp,"svm_type %s\n", svm_type_table[param.svm_type]);
 	fprintf(fp,"kernel_type %s\n", kernel_type_table[param.kernel_type]);
@@ -2893,11 +3209,11 @@ static char* readline(FILE *input)
 #define FSCANF(_stream, _format, _var) do{ if (fscanf(_stream, _format, _var) != 1) return false; }while(0)
 bool read_model_header(FILE *fp, svm_model* model)
 {
-	svm_parameter& param = model->param;
+	svm_parameter* param = &model->param;
 	// parameters for training only won't be assigned, but arrays are assigned as NULL for safety
-	param.nr_weight = 0;
-	param.weight_label = NULL;
-	param.weight = NULL;
+	param->nr_weight = 0;
+	param->weight_label = NULL;
+	param->weight = NULL;
 
 	char cmd[81];
 	while(1)
@@ -2912,7 +3228,7 @@ bool read_model_header(FILE *fp, svm_model* model)
 			{
 				if(strcmp(svm_type_table[i],cmd)==0)
 				{
-					param.svm_type=i;
+					param->svm_type=i;
 					break;
 				}
 			}
@@ -2930,7 +3246,7 @@ bool read_model_header(FILE *fp, svm_model* model)
 			{
 				if(strcmp(kernel_type_table[i],cmd)==0)
 				{
-					param.kernel_type=i;
+					param->kernel_type=i;
 					break;
 				}
 			}
@@ -2941,11 +3257,11 @@ bool read_model_header(FILE *fp, svm_model* model)
 			}
 		}
 		else if(strcmp(cmd,"degree")==0)
-			FSCANF(fp,"%d",&param.degree);
+			FSCANF(fp,"%d",&param->degree);
 		else if(strcmp(cmd,"gamma")==0)
-			FSCANF(fp,"%lf",&param.gamma);
+			FSCANF(fp,"%lf",&param->gamma);
 		else if(strcmp(cmd,"coef0")==0)
-			FSCANF(fp,"%lf",&param.coef0);
+			FSCANF(fp,"%lf",&param->coef0);
 		else if(strcmp(cmd,"nr_class")==0)
 			FSCANF(fp,"%d",&model->nr_class);
 		else if(strcmp(cmd,"total_sv")==0)

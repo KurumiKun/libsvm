@@ -1,4 +1,4 @@
-CXX ?= g++
+CXX ?= gcc
 CFLAGS = -Wall -Wconversion -O3 -fPIC
 SHVER = 3
 OS = $(shell uname)
@@ -23,6 +23,6 @@ svm-train: svm-train.c svm.o
 svm-scale: svm-scale.c
 	$(CXX) $(CFLAGS) svm-scale.c -o svm-scale
 svm.o: svm.cpp svm.h
-	$(CXX) $(CFLAGS) -c svm.cpp
+	$(CXX) $(CFLAGS) -c -x c svm.c
 clean:
 	rm -f *~ svm.o svm-train svm-predict svm-scale libsvm.so.$(SHVER)
