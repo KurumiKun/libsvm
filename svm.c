@@ -482,6 +482,7 @@ struct SolutionInfo_Struct {
 
 typedef struct Solver_Struct Solver;
 typedef struct Solver_NU_extends_Solver_Struct Solver_NU;
+enum { LOWER_BOUND, UPPER_BOUND, FREE };
 struct Solver_Struct {
 //public:
 //	Solver() {};
@@ -496,7 +497,7 @@ struct Solver_Struct {
 	int active_size;
 	schar *y;
 	double *G;		// gradient of objective function
-	enum { LOWER_BOUND, UPPER_BOUND, FREE };
+//	enum { LOWER_BOUND, UPPER_BOUND, FREE };
 	char *alpha_status;	// LOWER_BOUND, UPPER_BOUND, FREE
 	double *alpha;
 //	const QMatrix *Q;
